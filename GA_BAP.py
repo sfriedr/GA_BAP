@@ -21,7 +21,7 @@ c = Fertigstellung des Schiffs zur Stunde c -> c = u + p  (nicht gegeben)
 """
 
 basis_ordner = Path(__file__).parent # Ermittelt Ordner, in dem die Python-Datei liegt.
-pfad = basis_ordner / "Vorlage.csv" # Pfad zur CSV-Datei relativ zum Skript-Ordner
+pfad = basis_ordner / "data/Vorlage.csv" # Pfad zur CSV-Datei relativ zum Skript-Ordner
 df = pd.read_csv(pfad, sep=";", parse_dates=['u', 'a', 'c']) # 'u', 'a', 'c' von String zu Pandas.Timestamp casten
 df['a'] = df['a'].astype('datetime64[s]').astype('int64') # Wandelt Pandas.Timestamp (2023-01-02 22:42:20) in NumPy.int64 (1672617774)
 df['u'] = df['u'].astype('datetime64[s]').astype('int64')
@@ -37,17 +37,18 @@ print("column_count: ", column_count)
 print(f"\nSpalten:\n{', '.join(df.columns)}") # name, typ, teu, u, v, a, s, p, w, yard_pos, c
 print()
 
-
+rng = np.random.default_rng(seed=42)
 best_fitness_history: list[float] = []
 worst_fitness_history: list[float] = []
 #genes_of_best_individuals: list[tuple[float, float, float]] = []
 best_individuals: list[NDArray[np.int64]] = []
+reached_generation: int = 0
 
 
 # Constraints
 max_birthing_spots: int = 20
 max_yard_pos = df["yard_pos"].max() # 16
-a_min_limit: datetime = df['a'].min() # 1672617774
+a_min_limit: datetime = df['a'].min() # 1672617774 entspricht 023-02-01 00:02:54
 #a_min_limit: np.int64 = np.datetime64(a_min).astype("datetime64[s]").astype(np.int64)
 
 a_max_int64: np.int64 = df['a'].max()
@@ -60,12 +61,31 @@ number_birthing_spots: int = 20
 
 v_min_limit: int = 1
 v_max_limit: int = 20
-u_yyMMdd: np.int64 = np.int64(pd.to_datetime(df['a'].iloc[0], unit='s').normalize().timestamp())
+a_min: np.int64 = np.int64(pd.to_datetime(df['a'].min(), unit='s').normalize().timestamp()) # Holt nur das reine Datum yyyyMMdd der frühesten Ankunft.
 # Erstes Element von Spalte a holen (es ist in int64),
 # zu datetime casten, um normalize ausfühen zu können,
 # h, min, s abschneiden mit normalize,
 # als int64 speichern.
+# 1675209600 entspricht 2023-02-01 00:00:00
+a_max: np.int64 = a_min + 86400 # 1675296000 entspricht 2023-02-02 00:00:00
 
+
+# Strafen
+PENALTY_CONFLICT: float = 10.0 # Strafe pro überlappenden Schiffspaar. Addiert 1.000.000.000 zur Fitness.
+PENALTY_QUAY: float = 1e9 # Strafe pro Kaiplatz, der über den Kai hinausragt. Addiert 1.000.000.000 zur Fitness.
+
+
+ALPHA: float = 0.5
+BETA: float = 0.5
+A: NDArray[np.int64] = df['a'].to_numpy(dtype=np.int64) # Ankunftszeiten aller Schiffe
+P: NDArray[np.int64] = df['p'].to_numpy(dtype=np.int64)
+W: NDArray[np.int64] = df['w'].to_numpy(dtype=np.int64)
+S: NDArray[np.int64] = df['s'].to_numpy(dtype=np.int64)
+YARD_POS: NDArray[np.int64] = df['yard_pos'].to_numpy(dtype=np.int64)
+V_UPPER: NDArray[np.int64] = v_max_limit - S + 1
+D_MAX: float = float(np.sum(np.maximum(YARD_POS - v_min_limit, V_UPPER - YARD_POS)))
+T_MAX: float = float(np.sum(W * (a_max + P - A)))
+OVERLAP_NORM: float = float((number_vessels - 1) * np.sum(P * S))
 
 
 # Erzeugt Start-Population
@@ -74,12 +94,14 @@ u_yyMMdd: np.int64 = np.int64(pd.to_datetime(df['a'].iloc[0], unit='s').normaliz
 # u_v1 -> Gen u von Vessel 1
 # [ [[u_v1 u_v2 ... u_v25] [v_v1 v_v2 ... v_25]] [[u_v1 u_v2 ... u_v25] [v_v1 v_v2 ... v_25]] [[u_v1 u_v2 ... u_v25] [v_v1 v_v2 ... v_25]] [[u_v1 u_v2 ... u_v25] [v_v1 v_v2 ... v_25]]]]
 def create_initial_population(population_size: int) -> NDArray[np.int64]:
+    global rng
+    global v_min_limit
     global a_min_limit
     global a_max_limit
+    global a_max
     global number_vessels
     global number_birthing_spots
-
-    rng = np.random.default_rng(seed=42)
+    global V_UPPER
     
     # Alle u-Werte für die gesamte Population aufeinmal erzeugen
     u_pop: NDArray[np.int64] = rng.integers(a_min_limit, a_max_limit + 1, size=(population_size, number_vessels))
@@ -91,6 +113,12 @@ def create_initial_population(population_size: int) -> NDArray[np.int64]:
     # axis=1 sorgt dafür, dass u (Spalte 0) und v (Spalte 1) pro Schiff nebeneinander liegen
     population: NDArray[np.int64] = np.stack([u_pop,v_pop], axis=1)
 
+    # Schiffe dürfen nicht vor ihrer Ankunftszeit anlegen (u >= a) und sie dürfen nicht nach dem erlaubten Zeitraum (also 2.1.2023 00:00:00 - 3.1.2023 00:00:00) anlegen (u <= a_max)
+    population[:, 0, :] = np.clip(population[:, 0, :], A, a_max)
+
+    # schiffe müssen an die Kaimauer größentechnisch passen (v <= V_UPPER)
+    population[:, 1, :] = np.clip(population[:, 1, :], v_min_limit, V_UPPER)
+
     return population
 
 
@@ -98,25 +126,39 @@ def create_initial_population(population_size: int) -> NDArray[np.int64]:
 # Berechnet den Fitnesswert eines Individuums
 # Individuum repräsentiert als (Anzahl_Entscheidungsvariablen, Anzahl_Schiffe)
 # Beispiel (2, 25), Also Individuum bestehend aus 2 Entscheidungsvariablen und 25 Schiffe.
-# \[ \sum_{i=1}^{n} w_i * (c_i - a_i) + \sum_{i=1}^{n} \lvert yardpos_i - v_i \rvert \]
+# Zielfunktion: \[ \sum_{i=1}^{n} w_i * (c_i - a_i) + \sum_{i=1}^{n} \lvert yardpos_i - v_i \rvert \]
 def fitness_function(individual: NDArray[np.int64]) -> float:
-    global df
+    global ALPHA
+    global BETA
+    global A
+    global P
+    global W
+    global S
+    global YARD_POS
+    global D_MAX
+    global T_MAX
 
-    u: NDArray[np.int64] = individual[0]
-    v: NDArray[np.int64] = individual[1]
+    U: NDArray[np.int64] = individual[0]
+    V: NDArray[np.int64] = individual[1]
+    C: NDArray[np.int64] = U + P
+    v_end: NDArray[np.int64] = V + S
 
-    a: NDArray[np.int64] = df['a'].to_numpy()
-    p: NDArray[np.int64] = df['p'].to_numpy()
-    w: NDArray[np.int64] = df['w'].to_numpy()
-    yard_pos: NDArray[np.int64] = df['yard_pos'].to_numpy()
-    c: NDArray[np.int64] = u + p
+    time_term: float = float(np.sum(W * (C - A))) / T_MAX
+    dist_term: float = float(np.sum(np.abs(YARD_POS - V))) / D_MAX
+    objective: float = ALPHA * time_term + BETA * dist_term
 
-    sum_1: np.int64 = np.sum(w * (c - a))
-    sum_2: np.int64 = np.sum(abs(yard_pos - v))
-    fitness: float = float(sum_1 + sum_2)
-    if(fitness < 0):
-        return float('inf')
-    return fitness
+    time_ov = np.minimum(C[:, None], C[None, :]) - np.maximum(U[:, None], U[None, :])
+    space_ov = np.minimum(v_end[:, None], v_end[None, :]) - np.maximum(V[:, None], V[None, :])
+
+    conflict: NDArray[np.bool_] = (time_ov > 0) & (space_ov > 0)
+    conflict = np.triu(conflict, k=1)
+    n_conflicts: int = int(conflict.sum())
+
+    overlap_area: float = float(np.sum(np.where(conflict, time_ov * space_ov, 0))) / OVERLAP_NORM
+
+    return objective + PENALTY_CONFLICT * n_conflicts + overlap_area
+
+
 
 
 # Ermittlung der Elternpopulation
@@ -127,13 +169,14 @@ def fitness_function(individual: NDArray[np.int64]) -> float:
 # Die Populationsgröße von "selected" reduziert sich also nicht von y auf x, sondern ist gleich groß,
 # bestehend aus den besten Individuen der Kandidatenpopulation "population".
 def selection(population: NDArray[np.int64], fitnesses: list[float]) -> NDArray[np.int64]:
-    rng3 = np.random.default_rng(56)
-    selected: NDArray[np.int64] = np.array([], dtype=np.int64)
+    global rng
+    fit: NDArray[np.float64] = np.asarray(fitnesses) # shape (Populationsgröße,)
+    selected: list[NDArray[np.int64]] = []
     for _ in range(len(population)):
-        sample_indicies: NDArray[np.int64] = rng3.choice(len(fitnesses), size=3, replace=False)
-        best_sample_fitness_idx: int = sample_indicies.min()
-        selected = np.append(selected, population[best_sample_fitness_idx])
-    return population
+        idx: NDArray[np.int64] = rng.choice(len(fit), size=3, replace=False) # shape (3,)
+        winner: np.int64 = idx[np.argmin(fit[idx])]
+        selected.append(population[winner].copy())
+    return np.stack(selected)
 
 
 
@@ -145,8 +188,8 @@ def crossover(parent1: NDArray[np.int64], parent2: NDArray[np.int64]) ->tuple[ND
     # Es werden "number_vessels" zufällige Zahlen zwischen 0 und 1 erzeugt.
     # Zahlen größer als 0.5 werden als True gewertet.
     #mask = np.random.rand(number_vessels) > 0.5
-    rng2 = np.random.default_rng(25)
-    mask = rng2.random(number_vessels) > 0.5
+    global rng
+    mask = rng.random(number_vessels) > 0.5
 
     child1 = np.empty_like(parent1)
     child2 = np.empty_like(parent1)
@@ -163,36 +206,42 @@ def crossover(parent1: NDArray[np.int64], parent2: NDArray[np.int64]) ->tuple[ND
 # Mutieren von Kind
 # Child repräsentiert als (Anzahl_Entscheidungsvariablen, Anzahl_Schiffe)
 def mutation(child: NDArray[np.int64], mutation_rate: float):
+    global A
+    global rng
     global v_min_limit
     global v_max_limit
-    global u_yyMMdd
+    global a_min # 1675209600 entspricht 2023-02-01 00:00:00
+    global a_max # 1675296000 entspricht 2023-02-02 00:00:00
 
-    rng4 = np.random.default_rng(47)
     mutated: NDArray[np.int64] = child.copy()
 
-    # u mutieren - Erlaubter bereich von 00:00:01 bis 23:56:56 - Das Datum (2.1.2023) bleibt immer gleich
-    u_mask: NDArray[np.int64] = rng4.random(mutated[0].shape) < mutation_rate
+    # u mutieren - Erlaubter bereich von 00:00:00 bis 00:00:00 des Folgetages - Das Datum (1.2.2023) bleibt immer gleich
+    u_mask: NDArray[np.int64] = rng.random(mutated[0].shape) < mutation_rate
     if np.any(u_mask):
-        random_seconds = rng4.integers(1, 86400, size=np.sum(u_mask), dtype='int64')
-        mutated[0, u_mask] = u_yyMMdd + random_seconds
+        mutated[0, u_mask] = rng.integers(a_min, a_max+1, size=int(np.sum(u_mask)), dtype='int64')
 
     # v mutieren - Erlaubter bereich von "v_min_limit" bis "v_max_limit+1"
-    v_mask: NDArray[np.int64] = rng4.random(mutated[1].shape) < mutation_rate
+    v_mask: NDArray[np.int64] = rng.random(mutated[1].shape) < mutation_rate
     if np.any(v_mask):
-        new_values = rng4.integers(low=v_min_limit, high=v_max_limit+1, size=np.sum(v_mask), dtype='int64')
-        mutated[1, v_mask] = new_values
+        mutated[1, v_mask] = rng.integers(low=v_min_limit, high=v_max_limit+1, size=int(np.sum(v_mask)), dtype='int64')
+
+    mutated[0] = np.maximum(mutated[0], A) # u >= a -> zu kleine u-Werte auf Ankunftszeit anheben. Denn Schiffe können nicht vor ihrer Ankunftszeit am Hafen anlegen.
 
     return mutated
 
 
 # Bestimmt das beste Individuum
 # Individuum als Form von (Anzahl_Entscheidungsvariablen, Anzahl_Schiffe)
-def genetic_algorithm(population_size: int, mutation_rate: float, target_fitness: float = 0.0, max_generation: int = 20000, stagnation_limit: int = 15) -> NDArray[np.int64]:
+def genetic_algorithm(population_size: int, mutation_rate: float, target_fitness: float = 0.0, max_generation: int = 20000, stagnation_limit: int = 300) -> NDArray[np.int64]:
     current_fitness = float('inf')
     current_geneation: int = 0
+    global reached_generation
     global best_fitness_history
     global worst_fitness_history
     global best_individuals
+
+    if population_size % 2 != 0:
+        raise ValueError("Die Populationgröße muss gerade sein, denn Eltern werden paarweise gekreuzt.")
     
     population: NDArray[np.int64] = create_initial_population(population_size)
 
@@ -208,6 +257,7 @@ def genetic_algorithm(population_size: int, mutation_rate: float, target_fitness
                 break
 
         fitnesses: list[float] = [fitness_function(individuum) for individuum in population] # Liste von Fitnesswerten jedes Individuums.
+        #print("fitnesses: ", fitnesses,"\n\n")
 
         # Fürs plotten ----------------------<
         best_fit_idx: int = int(np.argmin(fitnesses))
@@ -218,30 +268,30 @@ def genetic_algorithm(population_size: int, mutation_rate: float, target_fitness
         worst_fitness: float = fitnesses[worst_fit_idx]
         worst_fitness_history.append(worst_fitness)
 
-        best_individuum: NDArray[np.int64] = population[best_fit_idx]
+        best_individuum: NDArray[np.int64] = population[best_fit_idx].copy()
         best_individuals.append(best_individuum.copy())
         # ----------------------------------->
 
-        population = selection(population, fitnesses)
+        parents: NDArray[np.int64] = selection(population, fitnesses)
 
-        next_population: NDArray[np.int64] = np.array([], dtype=np.int64)
-        #next_population: list[NDArray[np.int64]] = []
+        next_population: list[NDArray[np.int64]] = []
         for i in range(0, population_size, 2): # Paarweises durchlaufen der Elternpopulation
-            parent1: NDArray[np.int64] = population[i] # Dimension (Individuen, Anzahl_Schiffe, Anzahl_Gene) (2, 25, 2)
-            parent2: NDArray[np.int64] = population[i+1]
+            parent1: NDArray[np.int64] = parents[i] # Dimension (Individuen, Anzahl_Schiffe, Anzahl_Gene) (2, 25, 2)
+            parent2: NDArray[np.int64] = parents[i+1]
             
             child1, child2 = crossover(parent1, parent2)
 
             # Die nächste Generation sollte eine Liste sein. Denn das mehrfach-Befüllen von NPArrays ist langsamer als bei Listen, weil die Inhalte immer kopiert werden müssen.
-            next_population = np.append(next_population, mutation(child1.copy(), mutation_rate))
-            next_population = np.append(next_population, mutation(child2.copy(), mutation_rate))
+            next_population.append(mutation(child1, mutation_rate))
+            next_population.append(mutation(child2, mutation_rate))
 
-            next_population = np.append(next_population, best_individuum) # Elitismus - Das fiteste Individuum wird unverändert in die nächste Generation übernommen.
-            next_population = next_population # Generationswechsel - Die neu erzeugte Generation wird zur Arbeitsgrundlage für den nächsten Schleifendurchlauf.
+        next_population[0] = best_individuum.copy() # Elitismus - Das fiteste Individuum wird unverändert in die nächste Generation übernommen.
+        population = np.stack(next_population) # Generationswechsel - Die neu erzeugte Generation wird zur Arbeitsgrundlage für den nächsten Schleifendurchlauf.
 
         current_fitness = best_fitness
         current_geneation += 1
-    print("Generation erreicht: Generation ", current_geneation)
+    reached_generation = current_geneation
+    print("Generation erreicht: Generation ", reached_generation)
     return best_individuum
     
 
@@ -383,6 +433,24 @@ def convert_best_indiv_to_df(individual: NDArray[np.int64]) -> pd.DataFrame:
     return df_winner_indiv
 
 
+# Zeichnet die Entwicklung der besten Fitnesswerte über die Generationen
+def draw_best_fitness_evolvement():
+    global reached_generation
+
+    fig, ax = plt.subplots()
+    max_fitness_values: list[float] = best_fitness_history
+    min_fitness_values: list[float] = worst_fitness_history
+    x_values = range(reached_generation)
+
+    ax.plot(x_values, max_fitness_values, label='Best Fitness', color='black')
+    ax.fill_between(x_values, min_fitness_values, max_fitness_values, color='gray', alpha=0.5, label='Fitness Range')
+    ax.set_xlabel('Generation')
+    ax.set_ylabel('Fitness')
+    ax.set_title('Fitness Over Generations')
+    ax.legend()
+    plt.show()
+
+
 
 def get_total_stay_time(df_winner_indiv: pd.DataFrame) -> pd.Timedelta:
     parameter_arr: NDArray[np.int64] = df_winner_indiv[['c', 'a']].values.astype('datetime64[s]').T.astype(np.int64) # Form (3, 25)
@@ -402,7 +470,7 @@ def get_total_distance(df_winner_indiv: pd.DataFrame) -> np.int64:
 
 
 
-best_individual: NDArray[np.int64] = genetic_algorithm(population_size=100, mutation_rate=0.2, max_generation=1000)
+best_individual: NDArray[np.int64] = genetic_algorithm(population_size=100, mutation_rate=0.2, max_generation=2000)
 winner_fitness: float = best_fitness_history[len(best_fitness_history) - 1]
 print("Fitnesswert von bestem Indiviuum: ", winner_fitness) # 620917.0
 df_winner_indiv: pd.DataFrame = convert_best_indiv_to_df(best_individual)
@@ -411,4 +479,6 @@ print("Gesamte Aufenthaltszeit aller Schiffe: ", total_stay_time)
 total_distance: np.int64 = get_total_distance(df_winner_indiv)
 print("Gesamte Distanz aller Schiffe zu den Yard-Positionen: ", total_distance, "m")
 print()
+# print("\nbest_fitness_history: ", best_fitness_history)
 draw_individual(df_winner_indiv)
+draw_best_fitness_evolvement()
