@@ -39,6 +39,7 @@ Der Fitnesswert ist die Wartezeit bzw. Aufenthaltszeit unter Berücksichtigung d
 
 
 ## Ausgaben
+### Liegeplatzplan als Time-Space-Diagramm
 ![Liegeplatzplan als Time-Space-Diagramm](/docs/Screenshots/Time_Space_Diagram.png "Time-Space-Diagramm")
-
+### Fitnessverlauf-Diagramm (beste Fitness pro Generation und Fitnessbandbreite)
 ![Fitnessverlauf-Diagramm (beste Fitness pro Generation und Fitnessbandbreite)](/docs/Screenshots/Fitness_over_generations.png "Fitnessverlauf-Diagramm")
